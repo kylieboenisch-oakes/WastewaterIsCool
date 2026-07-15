@@ -24,20 +24,40 @@ geocode_osm <- function(address_string) {
 }
 
 # =====================================================================
-# 2A. HELPER FUNCTION: CLEAN WATER ACT (CWA) - WASTEWATER PLANTS
+# 2. RESILIENT API WRAPPER (Catches 429 Rate Limits & Auto-Retries!)
+# =====================================================================
+safe_fetch_json <- function(url, max_retries = 2, pause_seconds = 2) {
+  for (attempt in 1:max_retries) {
+    res <- tryCatch({
+      jsonlite::fromJSON(url)
+    }, error = function(e) {
+      if (grepl("429|500|502|503", e$message) && attempt < max_retries) {
+        message("[API Throttled] Server busy. Waiting ", pause_seconds, "s before retry...")
+        Sys.sleep(pause_seconds)
+        return(NULL)
+      }
+      stop(e)
+    })
+    if (!is.null(res)) return(res)
+  }
+  return(list())
+}
+
+# =====================================================================
+# 3A. HELPER FUNCTION: CLEAN WATER ACT (CWA) - WASTEWATER PLANTS
 # =====================================================================
 fetch_cwa_wastewater <- function(state_code) {
   message("--------------------------------------------------")
-  message("[CWA Engine] Fetching Wastewater Facilities for: ", toupper(state_code))
+  message("[CWA Engine] Fetching Major Wastewater Facilities for: ", toupper(state_code))
   
   url_a <- paste0("https://echodata.epa.gov/echo/cwa_rest_services.get_facility_info?output=JSON&p_act=Y&p_ptype=NPD&p_maj=Y&p_st=", toupper(state_code))
   
   tryCatch({
-    res_a <- jsonlite::fromJSON(url_a)
+    res_a <- safe_fetch_json(url_a)
     df_a  <- res_a$Results$Facilities
     if (is.null(df_a) || length(df_a) == 0 || !is.data.frame(df_a)) return(data.frame())
     
-    id_col_a  <- names(df_a)[grepl("SourceID|RegistryID|CWP_PERMIT_NUMBER|permit|id$", names(df_a), ignore.case = TRUE)][1]
+    id_col_a   <- names(df_a)[grepl("SourceID|RegistryID|CWP_PERMIT_NUMBER|permit|id$", names(df_a), ignore.case = TRUE)][1]
     name_col_a <- names(df_a)[grepl("name|facility", names(df_a), ignore.case = TRUE)][1]
     lat_col_a  <- names(df_a)[grepl("FacLat|^lat$|latitude", names(df_a), ignore.case = TRUE)][1]
     
@@ -48,10 +68,14 @@ fetch_cwa_wastewater <- function(state_code) {
       stringsAsFactors = FALSE
     ) %>% filter(!is.na(lat) & lat != 0) %>% arrange(join_name)
     
+    Sys.sleep(0.5)
+    
     url_token <- paste0("https://echodata.epa.gov/echo/cwa_rest_services.get_facilities?output=JSON&p_act=Y&p_ptype=NPD&p_maj=Y&p_st=", toupper(state_code))
-    res_token <- jsonlite::fromJSON(url_token)
+    res_token <- safe_fetch_json(url_token)
     qid       <- res_token$Results$QueryID
     if (is.null(qid) || is.na(qid) || qid == "") return(data.frame())
+    
+    Sys.sleep(0.5)
     
     url_b <- paste0("https://echodata.epa.gov/echo/cwa_rest_services.get_download?qid=", qid)
     df_b <- tryCatch({ read.csv(url_b, stringsAsFactors = FALSE, check.names = FALSE) }, error = function(e) data.frame())
@@ -79,8 +103,8 @@ fetch_cwa_wastewater <- function(state_code) {
       stringsAsFactors = FALSE
     ) %>% filter(!is.na(lng) & lng != 0) %>% mutate(lng = -1 * abs(lng)) %>% arrange(join_name)
     
-    merged_df <- inner_join(table_b_lng, table_a_lat, by = "join_id", suffix = c("", "_a"))
-    if (nrow(merged_df) == 0) merged_df <- inner_join(table_b_lng, table_a_lat, by = "join_name", suffix = c("", "_a"))
+    merged_df <- inner_join(table_b_lng, table_a_lat, by = "join_id", suffix = c("", "_a"), relationship = "many-to-many")
+    if (nrow(merged_df) == 0) merged_df <- inner_join(table_b_lng, table_a_lat, by = "join_name", suffix = c("", "_a"), relationship = "many-to-many")
     if (nrow(merged_df) == 0 && nrow(table_b_lng) == nrow(table_a_lat)) merged_df <- bind_cols(table_b_lng, table_a_lat %>% select(lat))
     
     merged_df <- merged_df %>% 
@@ -93,23 +117,23 @@ fetch_cwa_wastewater <- function(state_code) {
 }
 
 # =====================================================================
-# 2B. HELPER FUNCTION: SAFE DRINKING WATER ACT (SDWA) - DRINKING WATER
+# 3B. HELPER FUNCTION: SAFE DRINKING WATER ACT (SDWA) VIA MASTER REGISTRY
 # =====================================================================
 fetch_sdwa_drinking_water <- function(state_code) {
   message("--------------------------------------------------")
   message("[SDWA Engine] Fetching Municipal Drinking Water Facilities for: ", toupper(state_code))
   
-  # p_pwstype=CWS (Community Water Systems), p_pop_srv=3000 (Serving >3,000 residents to get municipal plants!)
-  url_a <- paste0("https://echodata.epa.gov/echo/sdwa_rest_services.get_systems?output=JSON&p_act=Y&p_pwstype=CWS&p_pop_srv=3000&p_st=", toupper(state_code))
+  Sys.sleep(1) # Polite pause
+  
+  url_a <- paste0("https://echodata.epa.gov/echo/echo_rest_services.get_facility_info?output=JSON&p_act=Y&p_med=S&p_st=", toupper(state_code))
   
   tryCatch({
-    res_a <- jsonlite::fromJSON(url_a)
-    # SDWA sometimes stores the table under $WaterSystems or $Facilities depending on server node
-    df_a  <- if (!is.null(res_a$Results$Facilities)) res_a$Results$Facilities else res_a$Results$WaterSystems
+    res_a <- safe_fetch_json(url_a)
+    df_a  <- res_a$Results$Facilities
     if (is.null(df_a) || length(df_a) == 0 || !is.data.frame(df_a)) return(data.frame())
     
-    id_col_a   <- names(df_a)[grepl("PWSID|SourceID|RegistryID|id$|systemid", names(df_a), ignore.case = TRUE)][1]
-    name_col_a <- names(df_a)[grepl("PWSName|name|facility|systemname", names(df_a), ignore.case = TRUE)][1]
+    id_col_a   <- names(df_a)[grepl("RegistryID|SourceID|permit|id$", names(df_a), ignore.case = TRUE)][1]
+    name_col_a <- names(df_a)[grepl("FacName|name|facility", names(df_a), ignore.case = TRUE)][1]
     lat_col_a  <- names(df_a)[grepl("FacLat|^lat$|latitude", names(df_a), ignore.case = TRUE)][1]
     
     table_a_lat <- data.frame(
@@ -119,16 +143,22 @@ fetch_sdwa_drinking_water <- function(state_code) {
       stringsAsFactors = FALSE
     ) %>% filter(!is.na(lat) & lat != 0) %>% arrange(join_name)
     
-    qid <- res_a$Results$QueryID
+    Sys.sleep(0.5)
+    
+    url_token <- paste0("https://echodata.epa.gov/echo/echo_rest_services.get_facilities?output=JSON&p_act=Y&p_med=S&p_st=", toupper(state_code))
+    res_token <- safe_fetch_json(url_token)
+    qid       <- res_token$Results$QueryID
     if (is.null(qid) || is.na(qid) || qid == "") return(data.frame())
     
-    url_b <- paste0("https://echodata.epa.gov/echo/sdwa_rest_services.get_download?qid=", qid)
+    Sys.sleep(0.5)
+    
+    url_b <- paste0("https://echodata.epa.gov/echo/echo_rest_services.get_download?qid=", qid)
     df_b <- tryCatch({ read.csv(url_b, stringsAsFactors = FALSE, check.names = FALSE) }, error = function(e) data.frame())
     if (is.null(df_b) || nrow(df_b) == 0) return(data.frame())
     
     valid_cols_b <- names(df_b)[!grepl("flg|flag|code|type|desc|status|date|waiv|pop|dens|acs|pct", names(df_b), ignore.case = TRUE)]
-    id_col_b     <- names(df_b)[grepl("PWSID|SourceID|RegistryID|id$|systemid", names(df_b), ignore.case = TRUE)][1]
-    name_col_b   <- names(df_b)[grepl("PWSName|name|facility|systemname", names(df_b), ignore.case = TRUE)][1]
+    id_col_b     <- names(df_b)[grepl("RegistryID|SourceID|permit|id$", names(df_b), ignore.case = TRUE)][1]
+    name_col_b   <- names(df_b)[grepl("FacName|name|facility", names(df_b), ignore.case = TRUE)][1]
     lng_col_b    <- valid_cols_b[grepl("FacLong|^lon$|^lng$|faclog|faclg|longitude", valid_cols_b, ignore.case = TRUE)][1]
     street_col   <- names(df_b)[grepl("street|addr", names(df_b), ignore.case = TRUE)][1]
     city_col     <- names(df_b)[grepl("city", names(df_b), ignore.case = TRUE)][1]
@@ -148,21 +178,27 @@ fetch_sdwa_drinking_water <- function(state_code) {
       stringsAsFactors = FALSE
     ) %>% filter(!is.na(lng) & lng != 0) %>% mutate(lng = -1 * abs(lng)) %>% arrange(join_name)
     
-    merged_df <- inner_join(table_b_lng, table_a_lat, by = "join_id", suffix = c("", "_a"))
-    if (nrow(merged_df) == 0) merged_df <- inner_join(table_b_lng, table_a_lat, by = "join_name", suffix = c("", "_a"))
+    merged_df <- inner_join(table_b_lng, table_a_lat, by = "join_id", suffix = c("", "_a"), relationship = "many-to-many")
+    if (nrow(merged_df) == 0) merged_df <- inner_join(table_b_lng, table_a_lat, by = "join_name", suffix = c("", "_a"), relationship = "many-to-many")
     if (nrow(merged_df) == 0 && nrow(table_b_lng) == nrow(table_a_lat)) merged_df <- bind_cols(table_b_lng, table_a_lat %>% select(lat))
     
+    # CRITICAL WORKAROUND: THE PRECISION MUNICIPAL WHITELIST
+    # Only keeps plants whose names contain true public utility or municipal keywords.
+    # Automatically blocks schools, HOA pumps, private estates, and un-tourable private systems!
     merged_df <- merged_df %>% 
       select(-any_of(c("join_id", "join_name", "join_name_a", "join_id_a"))) %>%
+      filter(grepl("WATER|TREATMENT|PLANT|UTILITY|UTILITIES|CITY OF|TOWN OF|BOARD|DISTRICT|AUTHORITY", name, ignore.case = TRUE)) %>%
+      # Ensure wastewater plants don't sneak into this drinking water table
+      filter(!grepl("WASTEWATER|WWTP|WRP|SEWAGE|RECLAMATION|EFFLUENT|OUTFALL|SEWER", name, ignore.case = TRUE)) %>%
       mutate(facility_type = "Drinking Water Treatment (SDWA)")
     
-    message("[SDWA Engine] Successfully loaded ", nrow(merged_df), " drinking water facilities.")
+    message("[SDWA Engine] Successfully loaded ", nrow(merged_df), " verified municipal drinking water facilities.")
     return(merged_df)
   }, error = function(e) { message("SDWA Query Failed: ", e$message); return(data.frame()) })
 }
 
 # =====================================================================
-# 3. USER INTERFACE (UI)
+# 4. USER INTERFACE (UI)
 # =====================================================================
 ui <- fluidPage(
   tags$head(
@@ -182,7 +218,6 @@ ui <- fluidPage(
       
       textInput("user_loc", "US City and State (e.g., Portland, OR):", value = "Portland, OR"),
       
-      # NEW: UI Toggle for Drinking Water vs Wastewater
       radioButtons("facility_type", "Select Facility Type:",
                    choices = c("Both (Wastewater & Drinking Water)" = "BOTH",
                                "Wastewater Treatment Only (CWA)" = "CWA",
@@ -195,7 +230,7 @@ ui <- fluidPage(
       actionButton("search_btn", "Search National Database", class = "btn btn-primary-custom", style = "width: 100%;"),
       
       hr(),
-      HTML("<small><b>Architecture Note:</b> Combines Clean Water Act (NPDES) and Safe Drinking Water Act (SDWA) Multi-Key Stitching engines to deliver unified municipal water data.</small>")
+      HTML("<small><b>Architecture Note:</b> Uses a positive municipal-only whitelist to ensure only real, tourable utility and treatment plant infrastructure is rendered.</small>")
     ),
     
     mainPanel(
@@ -208,7 +243,7 @@ ui <- fluidPage(
 )
 
 # =====================================================================
-# 4. SERVER LOGIC
+# 5. SERVER LOGIC
 # =====================================================================
 server <- function(input, output, session) {
   
@@ -231,7 +266,6 @@ server <- function(input, output, session) {
     state_match <- regmatches(toupper(input$user_loc), regexpr("\\b[A-Z]{2}\\b", toupper(input$user_loc)))
     state_code <- if (length(state_match) > 0) state_match[1] else "OR" 
     
-    # --- DYNAMIC API CALLS BASED ON USER SELECTION ---
     results_list <- list()
     
     if (input$facility_type %in% c("BOTH", "CWA")) {
@@ -244,7 +278,8 @@ server <- function(input, output, session) {
       if (nrow(sdwa_data) > 0) results_list$sdwa <- sdwa_data
     }
     
-    api_results <- bind_rows(results_list)
+    api_results <- bind_rows(results_list) %>%
+      distinct(permit_id, .keep_all = TRUE)
     
     if (nrow(api_results) == 0) {
       showNotification("Could not retrieve facilities for state: ", state_code, type = "warning")
@@ -268,20 +303,15 @@ server <- function(input, output, session) {
     }
     message("--------------------------------------------------")
     
-    # --- SMART KEYWORDS & ROWWISE URL ENCODING ---
     filtered_df <- processed_df %>%
       filter(distance_miles <= input$radius) %>%
       rowwise() %>% 
       mutate(
         clean_name = gsub("CITY OF |TOWN OF |VILLAGE OF | LLC| INC| CORP| CBWTP| WWTP| WRP| STP", "", name, ignore.case = TRUE),
-        
-        # Dynamically switch search keywords depending on whether it's drinking water or wastewater!
         tour_keyword = ifelse(grepl("SDWA", facility_type), 
                               "drinking water treatment plant public tour OR water facility visit", 
                               "wastewater treatment plant public tour OR education center visit"),
-        
         search_query = paste(clean_name, city, state, tour_keyword),
-        
         Tour_Link = paste0(
           "<a href='https://www.google.com/search?q=", 
           URLencode(search_query), 
@@ -307,7 +337,6 @@ server <- function(input, output, session) {
       )
     
     if (nrow(data$facilities) > 0) {
-      # Dynamically color map markers: Blue for Drinking Water, Orange for Wastewater!
       icons <- awesomeIcons(
         icon = "tint",
         iconColor = "#ffffff",
